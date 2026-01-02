@@ -1,0 +1,267 @@
+"""
+election.py - Bully Algorithm for leader election
+
+Implements the Bully Algorithm - highest ID wins.
+Nodes with higher IDs have higher priority to be leader.
+
+Basic flow:
+1. Send ELECTION to nodes with higher IDs
+2. If anyone responds, wait for them to become leader
+3. If no one responds, we're the leader
+4. New leader tells everyone via COORDINATOR message
+
+Member 2 - Traffic Light System
+"""
+
+import socket
+import threading
+import time
+import logging
+
+# Set up logging for debugging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class ElectionService:
+    """
+    Handles leader election using Bully Algorithm.
+    Highest ID node becomes the leader.
+    """
+    
+    def __init__(self, node_id, node_name, get_peers, on_leader_elected, send_message=None):
+        """Set up election service"""
+        self.node_id = node_id
+        self.node_name = node_name
+        self.get_peers = get_peers
+        self.on_leader_elected = on_leader_elected
+        self.send_message = send_message
+        
+        self._leader_id = None
+        self._leader_name = None
+        self._is_election_in_progress = False
+        self._received_answer = False
+        self._election_lock = threading.Lock()
+        
+        self.election_timeout = 5.0
+        self.coordinator_timeout = 5.0
+        
+        logger.info(f"Election service started for {node_name} (ID: {node_id})")
+    
+    @property
+    def leader_id(self):
+        """Get the current leader's ID (thread-safe)."""
+        return self._leader_id
+    
+    @property
+    def leader_name(self):
+        """Get the current leader's name (thread-safe)."""
+        return self._leader_name
+    
+    @property
+    def is_leader(self):
+        """Check if this node is the current leader."""
+        return self._leader_id == self.node_id
+    
+    def start_election(self):
+        """Start election - send ELECTION to higher ID nodes"""
+        with self._election_lock:
+            if self._is_election_in_progress:
+                return
+            
+            self._is_election_in_progress = True
+            self._received_answer = False
+        
+        logger.info(f"Node {self.node_name}: Starting election...")
+        
+        peers = self.get_peers()
+        
+        # Find nodes with higher IDs
+        higher_id_peers = {
+            peer_id: peer_info 
+            for peer_id, peer_info in peers.items() 
+            if peer_id > self.node_id
+        }
+        
+        if not higher_id_peers:
+            # No one has higher ID, we're the leader
+            logger.info(f"Node {self.node_name}: No higher-ID nodes, becoming leader")
+            self._become_leader()
+            return
+        
+        # Send ELECTION to all higher-ID nodes
+        for peer_id, peer_info in higher_id_peers.items():
+            self._send_election_message(peer_id, peer_info)
+        
+        # Wait for answers
+        timer_thread = threading.Thread(
+            target=self._wait_for_answer,
+            daemon=True
+        )
+        timer_thread.start()
+    
+    def _send_election_message(self, peer_id, peer_info):
+        """Send ELECTION message to a peer"""
+        if self.send_message:
+            message = {
+                'type': 'ELECTION',
+                'sender_id': self.node_id,
+                'sender_name': self.node_name,
+                'payload': {}
+            }
+            try:
+                self.send_message(peer_id, peer_info, message)
+            except Exception as e:
+                logger.error(f"Failed to send ELECTION to {peer_id}: {e}")
+    
+    def _wait_for_answer(self):
+        """Wait for responses from higher-ID nodes"""
+        time.sleep(self.election_timeout)
+        
+        with self._election_lock:
+            if not self._received_answer:
+                logger.info(f"Node {self.node_name}: No answer received, becoming leader")
+                self._become_leader()
+            else:
+                logger.info(f"Node {self.node_name}: Got answer, waiting for coordinator")
+                coordinator_timer = threading.Thread(
+                    target=self._wait_for_coordinator,
+                    daemon=True
+                )
+                coordinator_timer.start()
+    
+    def _wait_for_coordinator(self):
+        """Wait for coordinator msg, restart if needed"""
+        time.sleep(self.coordinator_timeout)
+        
+        with self._election_lock:
+            if self._leader_id is None:
+                logger.warning(f"Node {self.node_name}: No coordinator, restarting")
+                self._is_election_in_progress = False
+        
+        if self._leader_id is None:
+            self.start_election()
+    
+    def _become_leader(self):
+        """Set ourselves as leader and tell everyone"""
+        self._leader_id = self.node_id
+        self._leader_name = self.node_name
+        self._is_election_in_progress = False
+        
+        logger.info(f"*** Node {self.node_name} is now LEADER ***")
+        
+        self._broadcast_coordinator()
+        
+        if self.on_leader_elected:
+            self.on_leader_elected(self.node_id, self.node_name)
+    
+    def _broadcast_coordinator(self):
+        """Tell all nodes we're the leader"""
+        peers = self.get_peers()
+        
+        message = {
+            'type': 'COORDINATOR',
+            'sender_id': self.node_id,
+            'sender_name': self.node_name,
+            'payload': {
+                'leader_id': self.node_id,
+                'leader_name': self.node_name
+            }
+        }
+        
+        for peer_id, peer_info in peers.items():
+            if self.send_message:
+                try:
+                    self.send_message(peer_id, peer_info, message)
+                except Exception as e:
+                    logger.error(f"Failed to send COORDINATOR: {e}")
+    
+    def handle_election_message(self, msg):
+        """Got ELECTION from someone - respond if we have higher ID"""
+        sender_id = msg.get('sender_id')
+        sender_name = msg.get('sender_name', 'Unknown')
+        
+        logger.info(f"Node {self.node_name}: Got ELECTION from {sender_name}")
+        
+        # Only respond if we have a HIGHER ID than the sender
+        if self.node_id > sender_id:
+            # Send ANSWER and start our own election
+            self._send_answer_message(sender_id, msg.get('sender_info'))
+            
+            election_thread = threading.Thread(
+                target=self.start_election,
+                daemon=True
+            )
+            election_thread.start()
+    
+    def _send_answer_message(self, peer_id, peer_info):
+        """Send ANSWER - we're alive and have higher priority"""
+        if self.send_message:
+            message = {
+                'type': 'ANSWER',
+                'sender_id': self.node_id,
+                'sender_name': self.node_name,
+                'payload': {}
+            }
+            
+            if peer_info is None:
+                peers = self.get_peers()
+                peer_info = peers.get(peer_id)
+            
+            if peer_info:
+                try:
+                    self.send_message(peer_id, peer_info, message)
+                except Exception as e:
+                    logger.error(f"Failed to send ANSWER: {e}")
+    
+    def handle_answer_message(self, msg):
+        """Got ANSWER - someone with higher ID is alive"""
+        sender_id = msg.get('sender_id')
+        sender_name = msg.get('sender_name', 'Unknown')
+        
+        logger.info(f"Node {self.node_name}: Got ANSWER from {sender_name}")
+        
+        with self._election_lock:
+            self._received_answer = True
+    
+    def handle_coordinator_message(self, msg):
+        """New leader announcement - accept them"""
+        sender_id = msg.get('sender_id')
+        sender_name = msg.get('sender_name', 'Unknown')
+        
+        logger.info(f"Node {self.node_name}: Got COORDINATOR from {sender_name}")
+        
+        with self._election_lock:
+            self._leader_id = sender_id
+            self._leader_name = sender_name
+            self._is_election_in_progress = False
+            self._received_answer = False
+        
+        logger.info(f"Node {self.node_name}: Accepting {sender_name} as leader")
+        
+        if self.on_leader_elected:
+            self.on_leader_elected(sender_id, sender_name)
+    
+    def on_peer_failed(self, failed_peer_id):
+        """Peer died - if it was leader, start new election"""
+        logger.warning(f"Node {self.node_name}: Peer {failed_peer_id} failed")
+        
+        if failed_peer_id == self._leader_id:
+            logger.warning(f"Node {self.node_name}: Leader failed, starting election...")
+            
+            with self._election_lock:
+                self._leader_id = None
+                self._leader_name = None
+                self._is_election_in_progress = False
+            
+            self.start_election()
+    
+    def reset(self):
+        """Clear all election state"""
+        with self._election_lock:
+            self._leader_id = None
+            self._leader_name = None
+            self._is_election_in_progress = False
+            self._received_answer = False
+        
+        logger.info(f"Node {self.node_name}: Election reset")
