@@ -1,3 +1,20 @@
+"""
+sequencer.py - Reliable Ordered Multicast
+
+Implements reliable multicast with sequence numbers.
+
+Leader assigns sequence numbers to ensure all nodes get updates in same order.
+
+Each message gets a unique, incrementing sequence number.
+Receivers send ACK back to sender.
+Sender retries if no ACK within timeout.
+
+Important: All traffic lights must agree on which light is GREEN/YELLOW/RED.
+If messages arrive out of order or get lost, could have multiple GREEN lights (bad!).
+
+Member 2 - Traffic Light System
+"""
+
 import threading
 import time
 import logging
