@@ -198,6 +198,10 @@ class TrafficLightNode:
             elif msg_type == message.TYPE_ACK:
                 self.sequencer.handle_ack(msg)
 
+            elif msg_type == message.TYPE_NACK:
+                # Leader handles NACK: resend missing sequences
+                self.sequencer.handle_nack(msg)
+
             elif msg_type == "STATE_SYNC":
                 state = msg.get("payload", {})
                 self.sequencer.apply_sync_state(state)

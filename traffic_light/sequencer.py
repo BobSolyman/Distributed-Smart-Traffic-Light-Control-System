@@ -38,13 +38,23 @@ class Sequencer:
         self._pending = {}
         self._pending_lock = threading.Lock()
 
+        # Message history for NACK recovery (leader keeps recent messages)
+        self._message_history = {}  # seq -> msg (for resending on NACK)
+        self._history_lock = threading.Lock()
+        self._max_history_size = 100  # Keep last 100 messages for recovery
+
         # Follower state
         self._last_received_seq = 0
         self._message_buffer = {}  # seq -> msg
         self._buffer_lock = threading.Lock()
+        
+        # NACK state - track which seqs we've requested to avoid spam
+        self._pending_nacks = set()  # seq numbers we've sent NACKs for
+        self._nack_lock = threading.Lock()
 
         self._running = False
         self._resend_thread = None
+        self._nack_retry_thread = None
 
         logger.info(f"Sequencer initialized for {node_name} (ID: {node_id})")
 
@@ -52,6 +62,8 @@ class Sequencer:
         self._running = True
         self._resend_thread = threading.Thread(target=self._resend_monitor_loop, daemon=True)
         self._resend_thread.start()
+        self._nack_retry_thread = threading.Thread(target=self._nack_retry_loop, daemon=True)
+        self._nack_retry_thread.start()
         logger.info(f"Sequencer started for {self.node_name}")
 
     def stop(self):
@@ -59,9 +71,11 @@ class Sequencer:
         logger.info(f"Sequencer stopped for {self.node_name}")
 
     def reset(self, preserve_seq: bool = True):
-        with self._pending_lock, self._buffer_lock:
+        with self._pending_lock, self._buffer_lock, self._history_lock, self._nack_lock:
             self._pending.clear()
             self._message_buffer.clear()
+            self._message_history.clear()
+            self._pending_nacks.clear()
 
             if preserve_seq:
                 base = max(self._last_received_seq, self._sequence_num)
@@ -78,10 +92,11 @@ class Sequencer:
 
     def sync_sequence_num(self, last_seq: int):
         last_seq = int(last_seq)
-        with self._pending_lock, self._buffer_lock:
+        with self._pending_lock, self._buffer_lock, self._nack_lock:
             self._sequence_num = last_seq
             self._last_received_seq = last_seq
             self._message_buffer.clear()
+            self._pending_nacks.clear()
         logger.info(f"Node {self.node_name}: Synced sequence number to {last_seq}")
 
     # ----------------------------
@@ -114,6 +129,9 @@ class Sequencer:
 
         logger.info(f"Leader {self.node_name}: Broadcasting PHASE_UPDATE (seq={seq}, green={current_green})")
 
+        # Store in history for NACK recovery
+        self._store_in_history(seq, msg)
+
         for pid, pinfo in peers.items():
             try:
                 self.send_message(pid, pinfo, msg)
@@ -137,6 +155,108 @@ class Sequencer:
             if not entry["missing"]:
                 logger.info(f"Leader {self.node_name}: All ACKs received for seq={seq}")
                 self._pending.pop(seq, None)
+
+    # ----------------------------
+    # OMISSION FAULT RECOVERY
+    # ----------------------------
+    def _store_in_history(self, seq, msg):
+        """Store message in history for NACK-based recovery."""
+        with self._history_lock:
+            self._message_history[seq] = msg
+            # Prune old entries if history too large
+            if len(self._message_history) > self._max_history_size:
+                oldest = min(self._message_history.keys())
+                self._message_history.pop(oldest, None)
+
+    def handle_nack(self, msg):
+        """Leader handles NACK: resend requested sequence numbers."""
+        payload = msg.get("payload", {})
+        missing_seqs = payload.get("missing_seqs", [])
+        sender_id = msg.get("sender_id")
+        
+        if not missing_seqs or sender_id is None:
+            return
+        
+        peers = self.get_peers()
+        sender_info = peers.get(sender_id)
+        if not sender_info:
+            logger.warning(f"Leader {self.node_name}: NACK from unknown peer {sender_id}")
+            return
+        
+        logger.info(f"Leader {self.node_name}: Got NACK from {sender_id} for seqs {missing_seqs}")
+        
+        with self._history_lock:
+            for seq in missing_seqs:
+                seq = int(seq)
+                original_msg = self._message_history.get(seq)
+                if original_msg:
+                    # Resend the original message
+                    try:
+                        self.send_message(sender_id, sender_info, original_msg)
+                        logger.info(f"Leader {self.node_name}: Resent seq={seq} to {sender_id} (NACK recovery)")
+                    except Exception as e:
+                        logger.error(f"Leader {self.node_name}: Failed to resend seq={seq}: {e}")
+                else:
+                    logger.warning(f"Leader {self.node_name}: Seq={seq} not in history, can't recover")
+
+    def _send_nack(self, missing_seqs, leader_id, leader_info):
+        """Send NACK to leader requesting missing sequence numbers."""
+        if not missing_seqs:
+            return
+        
+        # Don't send NACK for seqs we've already requested
+        with self._nack_lock:
+            new_missing = [s for s in missing_seqs if s not in self._pending_nacks]
+            if not new_missing:
+                return
+            for s in new_missing:
+                self._pending_nacks.add(s)
+        
+        nack_msg = {
+            "type": message.TYPE_NACK,
+            "sender_id": self.node_id,
+            "sender_name": self.node_name,
+            "payload": {"missing_seqs": new_missing},
+        }
+        
+        try:
+            self.send_message(leader_id, leader_info, nack_msg)
+            logger.info(f"Node {self.node_name}: Sent NACK for seqs {new_missing} to leader {leader_id}")
+        except Exception as e:
+            logger.error(f"Node {self.node_name}: Failed to send NACK: {e}")
+
+    def _nack_retry_loop(self):
+        """Periodically retry NACKs for missing sequences that haven't arrived."""
+        nack_interval = getattr(config, "ACK_TIMEOUT", 0.5) * 2  # Check every 1 second
+        
+        while self._running:
+            time.sleep(nack_interval)
+            
+            expected = self._last_received_seq + 1
+            with self._buffer_lock:
+                buffered_seqs = set(self._message_buffer.keys())
+            
+            if not buffered_seqs:
+                continue
+            
+            # Find gaps: we have higher seqs buffered but missing some in between
+            max_buffered = max(buffered_seqs)
+            missing = []
+            for seq in range(expected, max_buffered):
+                if seq not in buffered_seqs:
+                    missing.append(seq)
+            
+            if missing:
+                # Get leader info to send NACK
+                peers = self.get_peers()
+                # Find the leader (sender of buffered messages)
+                with self._buffer_lock:
+                    sample_msg = next(iter(self._message_buffer.values()), None)
+                if sample_msg:
+                    leader_id = sample_msg.get("sender_id")
+                    leader_info = peers.get(leader_id)
+                    if leader_info:
+                        self._send_nack(missing, leader_id, leader_info)
 
     def _resend_monitor_loop(self):
         ack_timeout = getattr(config, "ACK_TIMEOUT", 0.5)
@@ -209,6 +329,11 @@ class Sequencer:
             with self._buffer_lock:
                 self._message_buffer[seq] = msg
             self._send_ack(msg, seq, leader_id, leader_info)
+            
+            # OMISSION FAULT RECOVERY: Send NACK for missing sequences
+            missing_seqs = list(range(expected, seq))
+            if missing_seqs and leader_id is not None and leader_info is not None:
+                self._send_nack(missing_seqs, leader_id, leader_info)
             return
 
         self._process_in_order(msg)
@@ -231,6 +356,10 @@ class Sequencer:
 
         logger.info(f"Node {self.node_name}: Processing seq={seq}, green={current_green}")
         self._last_received_seq = seq
+        
+        # Clear from pending NACKs since we received it
+        with self._nack_lock:
+            self._pending_nacks.discard(seq)
 
         try:
             self.on_phase_update(current_green, node_phases)
