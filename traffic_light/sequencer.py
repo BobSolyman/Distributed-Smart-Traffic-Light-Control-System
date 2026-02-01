@@ -2,6 +2,7 @@
 sequencer.py - Reliable Ordered Multicast
 
 Implements reliable multicast with sequence numbers.
+
 Leader assigns sequence numbers to ensure all nodes get updates in same order.
 
 Each message gets a unique, incrementing sequence number.
@@ -14,297 +15,260 @@ If messages arrive out of order or get lost, could have multiple GREEN lights (b
 Member 2 - Traffic Light System
 """
 
-import socket
 import threading
 import time
 import logging
-from collections import defaultdict
+from . import message
+from . import config
 
-# Set up logging for debugging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 class Sequencer:
-    """
-    Handles reliable multicast for traffic light updates.
-    
-    Leader sends phase updates with sequence numbers.
-    Followers send ACKs back to confirm receipt.
-    """
-    
-    def __init__(self, node_id, node_name, get_peers, send_message=None, on_phase_update=None):
-        """Set up sequencer"""
+    def __init__(self, node_id, node_name, get_peers, send_message, on_phase_update):
         self.node_id = node_id
         self.node_name = node_name
         self.get_peers = get_peers
         self.send_message = send_message
         self.on_phase_update = on_phase_update
-        
+
         # Leader state
         self._sequence_num = 0
-        self._pending_acks = {}
-        self._seq_lock = threading.Lock()
-        
+        # seq -> {"msg": msg, "missing": set(peer_ids), "last_sent": float, "retries": int}
+        self._pending = {}
+        self._pending_lock = threading.Lock()
+
         # Follower state
         self._last_received_seq = 0
-        self._message_buffer = {}
-        self._recv_lock = threading.Lock()
-        
-        # Config
-        self.ack_timeout = 3.0
-        self.max_retries = 3
-        self.retry_interval = 1.0
+        self._message_buffer = {}  # seq -> msg
+        self._buffer_lock = threading.Lock()
+
         self._running = False
-        
+        self._resend_thread = None
+
         logger.info(f"Sequencer initialized for {node_name} (ID: {node_id})")
-    
+
     def start(self):
-        """Start the sequencer service"""
         self._running = True
-        
-        self._retry_thread = threading.Thread(
-            target=self._retry_monitor_loop,
-            daemon=True
-        )
-        self._retry_thread.start()
-        
+        self._resend_thread = threading.Thread(target=self._resend_monitor_loop, daemon=True)
+        self._resend_thread.start()
         logger.info(f"Sequencer started for {self.node_name}")
-    
+
     def stop(self):
-        """Stop the sequencer"""
         self._running = False
         logger.info(f"Sequencer stopped for {self.node_name}")
-    
-    # ============================================
-    # LEADER Methods (Broadcasting Updates)
-    # ============================================
-    
-    def broadcast_phase_update(self, current_green_node, all_node_phases):
-        """
-        Leader sends phase update to all nodes
-        
-        Returns the sequence number for this update
-        """
+
+    def reset(self, preserve_seq: bool = True):
+        with self._pending_lock, self._buffer_lock:
+            self._pending.clear()
+            self._message_buffer.clear()
+
+            if preserve_seq:
+                base = max(self._last_received_seq, self._sequence_num)
+                self._sequence_num = base
+                self._last_received_seq = base
+            else:
+                self._sequence_num = 0
+                self._last_received_seq = 0
+
+        logger.info(
+            f"Node {self.node_name}: Sequencer reset (preserve_seq={preserve_seq}, "
+            f"seq={self._sequence_num}, last={self._last_received_seq})"
+        )
+
+    def sync_sequence_num(self, last_seq: int):
+        last_seq = int(last_seq)
+        with self._pending_lock, self._buffer_lock:
+            self._sequence_num = last_seq
+            self._last_received_seq = last_seq
+            self._message_buffer.clear()
+        logger.info(f"Node {self.node_name}: Synced sequence number to {last_seq}")
+
+    # ----------------------------
+    # LEADER: broadcast + retries
+    # ----------------------------
+    def broadcast_phase_update(self, current_green, node_phases):
         peers = self.get_peers()
-        
         if not peers:
             logger.warning(f"Node {self.node_name}: No peers to send to")
-            return 0
-        
-        with self._seq_lock:
+            return
+
+        with self._pending_lock:
             self._sequence_num += 1
-            seq_num = self._sequence_num
-            
-            message = {
-                'type': 'PHASE_UPDATE',
-                'sender_id': self.node_id,
-                'sender_name': self.node_name,
-                'payload': {
-                    'sequence_num': seq_num,
-                    'current_green_node': current_green_node,
-                    'node_phases': all_node_phases,
-                    'timestamp': time.time()
-                }
+            seq = self._sequence_num
+
+            payload = {"seq": seq, "current_green": current_green, "node_phases": node_phases}
+            msg = {
+                "type": message.TYPE_PHASE_UPDATE,
+                "sender_id": self.node_id,
+                "sender_name": self.node_name,
+                "payload": payload,
             }
-            
-            self._pending_acks[seq_num] = {
-                'message': message,
-                'pending_acks': set(peers.keys()),
-                'retries': 0,
-                'timestamp': time.time()
+
+            self._pending[seq] = {
+                "msg": msg,
+                "missing": set(peers.keys()),
+                "last_sent": time.time(),
+                "retries": 0,
             }
-        
-        logger.info(f"Leader {self.node_name}: Broadcasting PHASE_UPDATE (seq={seq_num}, green={current_green_node})")
-        
-        for peer_id, peer_info in peers.items():
-            self._send_phase_update(peer_id, peer_info, message)
-        
-        return seq_num
-    
-    def _send_phase_update(self, peer_id, peer_info, message):
-        """Send phase update to a peer"""
-        if self.send_message:
+
+        logger.info(f"Leader {self.node_name}: Broadcasting PHASE_UPDATE (seq={seq}, green={current_green})")
+
+        for pid, pinfo in peers.items():
             try:
-                self.send_message(peer_id, peer_info, message)
+                self.send_message(pid, pinfo, msg)
             except Exception as e:
-                logger.error(f"Failed to send PHASE_UPDATE to {peer_id}: {e}")
-    
-    def _retry_monitor_loop(self):
-        """Background thread to monitor and retry missing ACKs"""
-        while self._running:
-            time.sleep(self.retry_interval)
-            
-            current_time = time.time()
-            messages_to_retry = []
-            
-            with self._seq_lock:
-                for seq_num, ack_info in list(self._pending_acks.items()):
-                    if not ack_info['pending_acks']:
-                        del self._pending_acks[seq_num]
-                        continue
-                    
-                    elapsed = current_time - ack_info['timestamp']
-                    if elapsed > self.ack_timeout:
-                        if ack_info['retries'] < self.max_retries:
-                            messages_to_retry.append((seq_num, ack_info))
-                            ack_info['retries'] += 1
-                            ack_info['timestamp'] = current_time
-                        else:
-                            logger.warning(f"Gave up on seq={seq_num}, missing ACKs from: {ack_info['pending_acks']}")
-                            del self._pending_acks[seq_num]
-            
-            for seq_num, ack_info in messages_to_retry:
-                logger.info(f"Retrying PHASE_UPDATE seq={seq_num} (retry #{ack_info['retries']})")
-                peers = self.get_peers()
-                
-                for peer_id in ack_info['pending_acks']:
-                    if peer_id in peers:
-                        self._send_phase_update(peer_id, peers[peer_id], ack_info['message'])
-    
+                logger.error(f"Failed to send phase update to {pid}: {e}")
+
     def handle_ack(self, msg):
-        """Got ACK from follower - mark it as received"""
-        sender_id = msg.get('sender_id')
-        seq_num = msg.get('payload', {}).get('sequence_num')
-        
-        logger.debug(f"Leader {self.node_name}: Got ACK for seq={seq_num} from node {sender_id}")
-        
-        with self._seq_lock:
-            if seq_num in self._pending_acks:
-                self._pending_acks[seq_num]['pending_acks'].discard(sender_id)
-                
-                if not self._pending_acks[seq_num]['pending_acks']:
-                    logger.info(f"Leader {self.node_name}: All ACKs received for seq={seq_num}")
-                    del self._pending_acks[seq_num]
-    
-    # ============================================
-    # FOLLOWER Methods (Receiving Updates)
-    # ============================================
-    
+        payload = msg.get("payload", {})
+        seq = payload.get("seq")
+        sender = msg.get("sender_id")
+        if seq is None or sender is None:
+            return
+
+        seq = int(seq)
+        with self._pending_lock:
+            entry = self._pending.get(seq)
+            if not entry:
+                return
+
+            entry["missing"].discard(sender)
+            if not entry["missing"]:
+                logger.info(f"Leader {self.node_name}: All ACKs received for seq={seq}")
+                self._pending.pop(seq, None)
+
+    def _resend_monitor_loop(self):
+        ack_timeout = getattr(config, "ACK_TIMEOUT", 0.5)
+        max_retries = getattr(config, "MAX_RETRIES", 3)
+
+        while self._running:
+            time.sleep(ack_timeout)
+
+            now = time.time()
+            with self._pending_lock:
+                items = list(self._pending.items())
+
+            for seq, entry in items:
+                missing = entry["missing"]
+                if not missing:
+                    continue
+
+                if now - entry["last_sent"] < ack_timeout:
+                    continue
+
+                if entry["retries"] >= max_retries:
+                    logger.warning(
+                        f"Leader {self.node_name}: Gave up on seq={seq}, missing ACKs from: {missing}"
+                    )
+                    with self._pending_lock:
+                        self._pending.pop(seq, None)
+                    continue
+
+                entry["retries"] += 1
+                entry["last_sent"] = now
+
+                peers = self.get_peers()
+                msg = entry["msg"]
+                logger.info(f"Leader {self.node_name}: Retrying PHASE_UPDATE seq={seq} (retry #{entry['retries']})")
+
+                for pid in list(missing):
+                    pinfo = peers.get(pid)
+                    if not pinfo:
+                        continue
+                    try:
+                        self.send_message(pid, pinfo, msg)
+                    except Exception as e:
+                        logger.error(f"Retry send failed to {pid} for seq={seq}: {e}")
+
+    # ----------------------------
+    # FOLLOWER: ordered delivery
+    # ----------------------------
     def handle_phase_update(self, msg, leader_id=None, leader_info=None):
-        """
-        Got PHASE_UPDATE from leader - send ACK and process if in order
-        """
-        sender_id = msg.get('sender_id')
-        sender_name = msg.get('sender_name', 'Unknown')
-        payload = msg.get('payload', {})
-        
-        seq_num = payload.get('sequence_num')
-        current_green = payload.get('current_green_node')
-        node_phases = payload.get('node_phases', {})
-        
-        logger.info(f"Node {self.node_name}: Got PHASE_UPDATE (seq={seq_num}, green={current_green})")
-        
-        # Send ACK immediately
-        self._send_ack(sender_id, leader_info, seq_num)
-        
-        with self._recv_lock:
-            expected_seq = self._last_received_seq + 1
-            
-            if seq_num == expected_seq:
-                # This is the next message - process it
-                self._process_phase_update(seq_num, current_green, node_phases)
-                self._process_buffered_messages()
-                
-            elif seq_num > expected_seq:
-                # Out of order - buffer it
-                logger.warning(f"Node {self.node_name}: Out of order! Expected {expected_seq}, got {seq_num}")
-                self._message_buffer[seq_num] = {
-                    'current_green': current_green,
-                    'node_phases': node_phases
-                }
-                
-            else:
-                # Old message - already processed
-                logger.debug(f"Node {self.node_name}: Ignoring old seq={seq_num}")
-    
-    def _process_phase_update(self, seq_num, current_green, node_phases):
-        """Process the phase update and call callback"""
-        self._last_received_seq = seq_num
-        
-        logger.info(f"Node {self.node_name}: Processing seq={seq_num}, green={current_green}")
-        
-        if self.on_phase_update:
-            self.on_phase_update(current_green, node_phases)
-    
-    def _process_buffered_messages(self):
-        """Process any buffered out-of-order messages that are now in sequence"""
+        payload = msg.get("payload", {})
+        seq = payload.get("seq")
+        current_green = payload.get("current_green")
+        node_phases = payload.get("node_phases")
+
+        if seq is None:
+            logger.warning(f"Node {self.node_name}: PHASE_UPDATE missing seq")
+            return
+
+        seq = int(seq)
+        logger.info(f"Node {self.node_name}: Got PHASE_UPDATE (seq={seq}, green={current_green})")
+
+        expected = self._last_received_seq + 1
+
+        if seq < expected:
+            logger.info(f"Node {self.node_name}: Duplicate/old seq={seq}, expected={expected}, ignoring")
+            self._send_ack(msg, seq, leader_id, leader_info)
+            return
+
+        if seq > expected:
+            logger.warning(f"Node {self.node_name}: Out of order! Expected {expected}, got {seq}")
+            with self._buffer_lock:
+                self._message_buffer[seq] = msg
+            self._send_ack(msg, seq, leader_id, leader_info)
+            return
+
+        self._process_in_order(msg)
+        self._send_ack(msg, seq, leader_id, leader_info)
+
         while True:
             next_seq = self._last_received_seq + 1
-            
-            if next_seq in self._message_buffer:
-                buffered_msg = self._message_buffer.pop(next_seq)
-                self._process_phase_update(
-                    next_seq,
-                    buffered_msg['current_green'],
-                    buffered_msg['node_phases']
-                )
-            else:
+            with self._buffer_lock:
+                buffered = self._message_buffer.pop(next_seq, None)
+            if not buffered:
                 break
-    
-    def _send_ack(self, leader_id, leader_info, seq_num):
-        """Send ACK back to leader"""
-        if self.send_message:
-            message = {
-                'type': 'ACK',
-                'sender_id': self.node_id,
-                'sender_name': self.node_name,
-                'payload': {
-                    'sequence_num': seq_num
-                }
-            }
-            
-            if leader_info is None:
-                peers = self.get_peers()
-                leader_info = peers.get(leader_id)
-            
-            if leader_info:
-                try:
-                    self.send_message(leader_id, leader_info, message)
-                except Exception as e:
-                    logger.error(f"Failed to send ACK: {e}")
-    
-    # ============================================
-    # State Synchronization (for rejoining nodes)
-    # ============================================
-    
-    def get_current_sequence_num(self):
-        """Get the current sequence number"""
-        with self._seq_lock:
-            return self._sequence_num
-    
-    def sync_sequence_num(self, seq_num):
-        """Sync sequence number when rejoining"""
-        with self._seq_lock:
-            self._sequence_num = seq_num
-        
-        with self._recv_lock:
-            self._last_received_seq = seq_num
-        
-        logger.info(f"Node {self.node_name}: Synced sequence number to {seq_num}")
-    
-    def reset(self):
-        """Clear all sequencer state"""
-        with self._seq_lock:
-            self._sequence_num = 0
-            self._pending_acks.clear()
-        
-        with self._recv_lock:
-            self._last_received_seq = 0
-            self._message_buffer.clear()
-        
-        logger.info(f"Node {self.node_name}: Sequencer reset")
-    
+            self._process_in_order(buffered)
+            self._send_ack(buffered, next_seq, leader_id, leader_info)
+
+    def _process_in_order(self, msg):
+        payload = msg.get("payload", {})
+        seq = int(payload.get("seq", 0))
+        current_green = payload.get("current_green")
+        node_phases = payload.get("node_phases", {})
+
+        logger.info(f"Node {self.node_name}: Processing seq={seq}, green={current_green}")
+        self._last_received_seq = seq
+
+        try:
+            self.on_phase_update(current_green, node_phases)
+        except Exception as e:
+            logger.error(f"Node {self.node_name}: Error applying phase update: {e}")
+
+    def _send_ack(self, msg, seq, leader_id=None, leader_info=None):
+        leader = leader_id if leader_id is not None else msg.get("sender_id")
+        if leader is None:
+            return
+
+        peers = self.get_peers()
+        info = leader_info if leader_info is not None else peers.get(leader)
+        if not info:
+            return
+
+        ack = {
+            "type": message.TYPE_ACK,
+            "sender_id": self.node_id,
+            "sender_name": self.node_name,
+            "payload": {"seq": int(seq)},
+        }
+        try:
+            self.send_message(leader, info, ack)
+        except Exception as e:
+            logger.error(f"Node {self.node_name}: Failed to send ACK for seq={seq} to leader {leader}: {e}")
+
+    # ----------------------------
+    # STATE SYNC for joining nodes
+    # ----------------------------
     def get_state_for_sync(self):
-        """Get current state for synchronization"""
-        with self._seq_lock:
-            return {
-                'sequence_num': self._sequence_num,
-                'timestamp': time.time()
-            }
-    
+        base = max(self._sequence_num, self._last_received_seq)
+        return {"sequence_num": base}
+
     def apply_sync_state(self, state):
-        """Apply sync state from leader"""
-        if 'sequence_num' in state:
-            self.sync_sequence_num(state['sequence_num'])
-            logger.info(f"Node {self.node_name}: Applied sync state, seq={state['sequence_num']}")
+        seq = int(state.get("sequence_num", 0))
+        with self._pending_lock, self._buffer_lock:
+            self._sequence_num = seq
+            self._last_received_seq = seq
+            self._message_buffer.clear()
+        logger.info(f"Node {self.node_name}: Applied sync state, seq={seq}")

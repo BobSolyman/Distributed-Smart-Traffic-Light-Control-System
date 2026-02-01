@@ -225,11 +225,20 @@ class ElectionService:
             self._received_answer = True
     
     def handle_coordinator_message(self, msg):
-        """New leader announcement - accept them"""
+        """New leader announcement - only accept from higher-ID nodes"""
         sender_id = msg.get('sender_id')
         sender_name = msg.get('sender_name', 'Unknown')
         
         logger.info(f"Node {self.node_name}: Got COORDINATOR from {sender_name}")
+        
+        # Only accept COORDINATOR from nodes with higher or equal ID
+        # This prevents lower-ID nodes from incorrectly claiming leadership
+        if sender_id < self.node_id:
+            logger.info(f"Node {self.node_name}: Ignoring COORDINATOR from {sender_name} (lower ID)")
+            # We have higher ID, so we should be leader - start election
+            if not self._is_election_in_progress:
+                threading.Thread(target=self.start_election, daemon=True).start()
+            return
         
         with self._election_lock:
             self._leader_id = sender_id
