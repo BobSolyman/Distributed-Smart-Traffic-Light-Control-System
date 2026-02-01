@@ -10,7 +10,7 @@ BUFFER_SIZE = 4096
 
 # Timing Configuration (in seconds)
 HEARTBEAT_INTERVAL = 1.0
-HEARTBEAT_TIMEOUT = 3.0  # As per Fault Tolerance section
+HEARTBEAT_TIMEOUT = 6.0  # As per Fault Tolerance section
 DISCOVERY_INTERVAL = 2.0
 ELECTION_TIMEOUT = 5.0
 

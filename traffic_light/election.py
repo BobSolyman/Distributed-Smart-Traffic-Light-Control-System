@@ -46,6 +46,13 @@ class ElectionService:
         self.election_timeout = 5.0
         self.coordinator_timeout = 5.0
         
+        # Reliable COORDINATOR delivery
+        self._coordinator_ack_timeout = 0.5  # Time to wait for each ACK
+        self._coordinator_max_retries = 5    # Max retries per peer
+        self._pending_coordinator_acks = {}  # peer_id -> {'retries': n, 'peer_info': info}
+        self._coordinator_ack_lock = threading.Lock()
+        self._coordinator_retry_thread = None
+        
         logger.info(f"Election service started for {node_name} (ID: {node_id})")
     
     @property
@@ -156,9 +163,36 @@ class ElectionService:
             self.on_leader_elected(self.node_id, self.node_name)
     
     def _broadcast_coordinator(self):
-        """Tell all nodes we're the leader"""
+        """Tell all nodes we're the leader with reliable delivery"""
         peers = self.get_peers()
         
+        if not peers:
+            logger.info(f"Node {self.node_name}: No peers to notify about leadership")
+            return
+        
+        # Initialize pending ACKs for all peers
+        with self._coordinator_ack_lock:
+            self._pending_coordinator_acks.clear()
+            for peer_id, peer_info in peers.items():
+                self._pending_coordinator_acks[peer_id] = {
+                    'retries': 0,
+                    'peer_info': peer_info,
+                    'last_sent': time.time()
+                }
+        
+        # Send initial COORDINATOR to all peers
+        self._send_coordinator_to_pending()
+        
+        # Start retry thread
+        if self._coordinator_retry_thread is None or not self._coordinator_retry_thread.is_alive():
+            self._coordinator_retry_thread = threading.Thread(
+                target=self._coordinator_retry_loop,
+                daemon=True
+            )
+            self._coordinator_retry_thread.start()
+    
+    def _send_coordinator_to_pending(self):
+        """Send COORDINATOR message to all peers that haven't ACKed yet"""
         message = {
             'type': 'COORDINATOR',
             'sender_id': self.node_id,
@@ -169,12 +203,54 @@ class ElectionService:
             }
         }
         
-        for peer_id, peer_info in peers.items():
-            if self.send_message:
-                try:
-                    self.send_message(peer_id, peer_info, message)
-                except Exception as e:
-                    logger.error(f"Failed to send COORDINATOR: {e}")
+        with self._coordinator_ack_lock:
+            for peer_id, ack_info in list(self._pending_coordinator_acks.items()):
+                if self.send_message:
+                    try:
+                        self.send_message(peer_id, ack_info['peer_info'], message)
+                        ack_info['last_sent'] = time.time()
+                        if ack_info['retries'] > 0:
+                            logger.info(f"Node {self.node_name}: Retrying COORDINATOR to {peer_id} (retry #{ack_info['retries']})")
+                    except Exception as e:
+                        logger.error(f"Failed to send COORDINATOR to {peer_id}: {e}")
+    
+    def _coordinator_retry_loop(self):
+        """Retry COORDINATOR messages until all ACKs received or max retries"""
+        while self._leader_id == self.node_id:  # Only retry while we're still leader
+            time.sleep(self._coordinator_ack_timeout)
+            
+            with self._coordinator_ack_lock:
+                if not self._pending_coordinator_acks:
+                    logger.info(f"Node {self.node_name}: All COORDINATOR ACKs received")
+                    break
+                
+                # Check which peers need retry
+                peers_to_remove = []
+                for peer_id, ack_info in self._pending_coordinator_acks.items():
+                    ack_info['retries'] += 1
+                    
+                    if ack_info['retries'] > self._coordinator_max_retries:
+                        logger.warning(f"Node {self.node_name}: Gave up on COORDINATOR to {peer_id} after {self._coordinator_max_retries} retries")
+                        peers_to_remove.append(peer_id)
+                
+                for peer_id in peers_to_remove:
+                    del self._pending_coordinator_acks[peer_id]
+                
+                if not self._pending_coordinator_acks:
+                    break
+            
+            # Send retries
+            self._send_coordinator_to_pending()
+    
+    def handle_coordinator_ack(self, msg):
+        """Handle COORDINATOR_ACK - peer acknowledged our leadership"""
+        sender_id = msg.get('sender_id')
+        sender_name = msg.get('sender_name', 'Unknown')
+        
+        with self._coordinator_ack_lock:
+            if sender_id in self._pending_coordinator_acks:
+                del self._pending_coordinator_acks[sender_id]
+                logger.info(f"Node {self.node_name}: Got COORDINATOR_ACK from {sender_name}")
     
     def handle_election_message(self, msg):
         """Got ELECTION from someone - respond if we have higher ID"""
@@ -248,8 +324,36 @@ class ElectionService:
         
         logger.info(f"Node {self.node_name}: Accepting {sender_name} as leader")
         
+        # Send ACK back to new leader
+        self._send_coordinator_ack(sender_id, msg.get('sender_info'))
+        
         if self.on_leader_elected:
             self.on_leader_elected(sender_id, sender_name)
+    
+    def _send_coordinator_ack(self, leader_id, leader_info):
+        """Send COORDINATOR_ACK to the new leader"""
+        if leader_info is None:
+            peers = self.get_peers()
+            leader_info = peers.get(leader_id)
+        
+        if leader_info is None:
+            logger.warning(f"Node {self.node_name}: Cannot send COORDINATOR_ACK - no info for leader {leader_id}")
+            return
+        
+        if self.send_message:
+            message = {
+                'type': 'COORDINATOR_ACK',
+                'sender_id': self.node_id,
+                'sender_name': self.node_name,
+                'payload': {
+                    'leader_id': leader_id
+                }
+            }
+            try:
+                self.send_message(leader_id, leader_info, message)
+                logger.info(f"Node {self.node_name}: Sent COORDINATOR_ACK to {leader_id}")
+            except Exception as e:
+                logger.error(f"Failed to send COORDINATOR_ACK: {e}")
     
     def on_peer_failed(self, failed_peer_id):
         """Peer died - if it was leader, start new election"""

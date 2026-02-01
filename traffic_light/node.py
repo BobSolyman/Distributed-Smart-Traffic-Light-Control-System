@@ -189,7 +189,16 @@ class TrafficLightNode:
                 self.election.handle_answer_message(msg)
 
             elif msg_type == message.TYPE_COORDINATOR:
+                # Add sender info for ACK response
+                peer_info = self.heartbeat.get_peers().get(sender_id, None)
+                if not peer_info:
+                    peer_info = {"ip": addr[0], "port": addr[1]}
+                msg["sender_info"] = peer_info
                 self.election.handle_coordinator_message(msg)
+
+            elif msg_type == message.TYPE_COORDINATOR_ACK:
+                # Leader receives ACK for COORDINATOR message
+                self.election.handle_coordinator_ack(msg)
 
             elif msg_type == message.TYPE_PHASE_UPDATE:
                 leader_info = self.heartbeat.get_peers().get(sender_id, None)
@@ -197,6 +206,10 @@ class TrafficLightNode:
 
             elif msg_type == message.TYPE_ACK:
                 self.sequencer.handle_ack(msg)
+
+            elif msg_type == message.TYPE_NACK:
+                # Leader handles NACK: resend missing sequences
+                self.sequencer.handle_nack(msg)
 
             elif msg_type == "STATE_SYNC":
                 state = msg.get("payload", {})

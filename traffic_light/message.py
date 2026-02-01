@@ -13,8 +13,11 @@ TYPE_DISCOVERY = 'DISCOVERY'
 TYPE_HEARTBEAT = 'HEARTBEAT'
 TYPE_ELECTION = 'ELECTION'
 TYPE_COORDINATOR = 'COORDINATOR'
+TYPE_COORDINATOR_ACK = 'COORDINATOR_ACK'  # Acknowledge COORDINATOR message (reliable leader announcement)
 TYPE_PHASE_UPDATE = 'PHASE_UPDATE'
 TYPE_ACK = 'ACK'
+TYPE_NACK = 'NACK'  # Request missing sequence numbers (omission fault recovery)
+TYPE_NACK_RESPONSE = 'NACK_RESPONSE'  # Resend requested messages
 
 def create_message(msg_type, sender_id, payload=None):
     """
